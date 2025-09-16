@@ -5,6 +5,10 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cerrno>
+#include <cassert>
+
+const size_t max_message_size = 4096;
 
 void die(const char* msg) {
     perror(msg);
@@ -15,17 +19,62 @@ void msg(const char* message) {
     fprintf(stderr, "%s\n", message);
 }
 
-static void serverWrite(int fd) {
-    char rbuf[64] = {};
-    ssize_t n = read(fd, rbuf, sizeof(rbuf));
-    if (n < 0) {
-        msg("read() error");
-        return;
+static int32_t read_full(int fd, char *buf, size_t n) {
+    while (n > 0) {
+        ssize_t rv = read(fd, buf, n);
+        if (rv <= 0) {
+            return -1;  // error, or unexpected EOF
+        }
+        assert((size_t)rv <= n);
+        n -= (size_t)rv;
+        buf += rv;
     }
-    printf("client says: %s\n", rbuf);
+    return 0;
+}
 
-    char wbuf[64] = "world";
-    write(fd, wbuf, strlen(wbuf));
+static int32_t write_all(int fd, const char *buf, size_t n) {
+    while (n > 0) {
+        ssize_t rv = write(fd, buf, n);
+        if (rv <= 0) {
+            return -1;  // error
+        }
+        assert((size_t)rv <= n);
+        n -= (size_t)rv;
+        buf += rv;
+    }
+    return 0;
+}
+
+static int32_t handleRequest(int fd) {
+    // Process request header.
+    char rbuf[max_message_size + 4];
+    errno = 0;
+    int32_t err = read_full(fd, rbuf, 4);
+    if (err) {
+        return err;
+    }
+    uint32_t len = 0;
+    memcpy(&len, rbuf, 4);
+    if (len > max_message_size) {
+        msg("too long");
+        return -1;
+    }
+
+    // Process request body.
+    err = read_full(fd, &rbuf[4], len);
+    if (err) {
+        msg("read_full()");
+        return err;
+    }
+    printf("client says: %.*s\n", len, &rbuf[4]);
+
+    // Reply with same protocol.
+    const char reply[] = "world";
+    char wbuf[4 + sizeof(reply)];
+    len = (uint32_t)strlen(reply);
+    memcpy(wbuf, &len, 4);
+    memcpy(&wbuf[4], reply, len);
+    return write_all(fd, wbuf, 4 + len);
 }
 
 int main() {
@@ -53,7 +102,12 @@ int main() {
             continue;
         }
 
-        serverWrite(connfd);
+        while (true) {
+            int32_t err = handleRequest(connfd);
+            if (err) {
+                break;
+            }
+        }
         close(connfd);
     }
     return 0;
