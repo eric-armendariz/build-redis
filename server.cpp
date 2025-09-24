@@ -12,8 +12,10 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
+#include <string>
 // C++
 #include <vector>
+#include <map>
 
 static void msg(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -47,6 +49,10 @@ static void fd_set_nb(int fd) {
 
 // append to the back
 static void bufAppend(std::vector<uint8_t> &buf, const uint8_t *data, size_t len) {
+    if (len == 0) {
+        return;
+    }
+    assert(data != nullptr);
     buf.insert(buf.end(), data, data + len);
 }
 // remove from the front
@@ -65,6 +71,17 @@ struct Conn {
     // buffers containing I/O of conn
     std::vector<uint8_t> incoming;
     std::vector<uint8_t> outgoing;
+};
+
+enum {
+    RES_OK = 0,
+    RES_ERR = 1,
+    RES_NX = 2,
+};
+
+struct Response {
+    uint32_t status = 0;
+    std::vector<uint8_t> data;
 };
 
 static Conn *handleAccept(int fd) {
@@ -92,6 +109,75 @@ static Conn *handleAccept(int fd) {
     return conn;
 }
 
+bool readUInt32(const uint8_t *&curr, const uint8_t *end, uint32_t &out) {
+    if (curr + 4 > end) {
+        return false;
+    }
+    memcpy(&out, curr, 4);
+    curr += 4;
+    return true;
+}
+
+bool readStr(const uint8_t *&curr, const uint8_t *end, size_t size, std::string &out) {
+    if (curr + size > end) {
+        return false;
+    }
+    out.assign(curr, curr + size);
+    curr += size;
+    return true;
+}
+
+uint32_t parseRequest(const uint8_t *data, size_t size, std::vector<std::string> &out) {
+    const uint8_t *end = data + size;
+    uint32_t nStr = 0;
+    if (!readUInt32(data, end, nStr)) {
+        return -1;
+    }
+
+    while (out.size() < nStr) {
+        uint32_t len = 0;
+        if (!readUInt32(data, end, len)) {
+            return -1;
+        }
+
+        out.push_back(std::string());
+        if (!readStr(data, end, len, out.back())) {
+            return -1;
+        }
+    }
+    if (data != end) {
+        return -1;
+    }
+    return 0;
+}
+
+static std::map<std::string, std::string> gData;
+
+static void doRequest(std::vector<std::string> &cmd, Response &resp) {
+    if (cmd.size() == 2 && cmd[0] == "get") {
+        auto it = gData.find(cmd[1]);
+        if (it == gData.end()) {
+            resp.status = RES_NX;
+            return;
+        }
+        const std::string &val = it->second;
+        resp.data.assign(val.begin(), val.end());
+    } else if (cmd.size() == 3 && cmd[0] == "set") {
+        gData[cmd[1]].swap(cmd[2]);
+    } else if (cmd.size() == 2 && cmd[0] == "del") {
+        gData.erase(cmd[1]);
+    } else {
+        resp.status = RES_ERR;
+    }
+}
+
+void makeResponse(std::vector<std::uint8_t> &buf, Response &resp) {
+    uint32_t respLen = 4 + (uint32_t) resp.data.size();
+    bufAppend(buf, (const uint8_t *)&respLen, 4);
+    bufAppend(buf, (const uint8_t *)&resp.status, 4);
+    bufAppend(buf, resp.data.data(), resp.data.size());
+}
+
 static bool tryOneRequest(Conn *conn) {
     // 3. Try to parse the accumulated buffer.
     // Protocol: message header
@@ -99,7 +185,7 @@ static bool tryOneRequest(Conn *conn) {
         return false;
     }
     uint32_t len = 0;
-    memcpy(&len, &conn->incoming[0], 4);
+    memcpy(&len, conn->incoming.data(), 4);
     if (len > k_max_msg) {
         conn->wantClose = true;
         return false;
@@ -109,13 +195,41 @@ static bool tryOneRequest(Conn *conn) {
         return false;
     }
     const uint8_t *request = &conn->incoming[4];
+    std::vector<std::string> cmd;
+    if (parseRequest(request, len, cmd) < 0) {
+        msg("bad req");
+        conn->wantClose = true;
+        return false;
+    }
     // 4. Process the parsed message
     // generate the response
-    bufAppend(conn->outgoing, (const uint8_t *)&len, 4);
-    bufAppend(conn->outgoing, request, len);
+    Response resp;
+    doRequest(cmd, resp);
+    makeResponse(conn->outgoing, resp);
+
     // 5. Remove the message from conn->incoming.
     bufConsume(conn->incoming, 4 + len);
     return true;
+}
+
+static void handleWrite(Conn *conn) {
+    assert(conn->outgoing.size() > 0);
+    ssize_t rv = write(conn->fd, &conn->outgoing[0], conn->outgoing.size());
+    if (rv < 0 && errno == EAGAIN) {
+        return; 
+    }
+    if (rv < 0) {
+        msg_errno("write() error");
+        conn->wantClose = true;
+        return;
+    }
+    // remove written data from conn->outgoing
+    bufConsume(conn->outgoing, (size_t)rv);
+    // update readiness intention
+    if (conn->outgoing.size() == 0) {
+        conn->wantWrite = false;
+        conn->wantRead = true;
+    }
 }
 
 static void handleRead(Conn *conn) {
@@ -139,7 +253,7 @@ static void handleRead(Conn *conn) {
             msg("unexpected EOF");
         }
         conn->wantClose = true;
-        return; // want close
+        return;
     }
     // 2. Add new data to the Conn->incoming buf
     bufAppend(conn->incoming, buf, (size_t)rv);
@@ -149,22 +263,7 @@ static void handleRead(Conn *conn) {
     if (conn->outgoing.size() > 0) {
         conn->wantWrite = true;
         conn->wantRead = false;
-    }
-}
-
-static void handleWrite(Conn *conn) {
-    assert(conn->outgoing.size() > 0);
-    ssize_t rv = write(conn->fd, &conn->outgoing[0], conn->outgoing.size());
-    if (rv <= 0) {
-        conn->wantClose = true;
-        return;
-    }
-    // remove written data from conn->outgoing
-    bufConsume(conn->outgoing, (size_t)rv);
-    // update readiness intention
-    if (conn->outgoing.size() == 0) {
-        conn->wantWrite = false;
-        conn->wantRead = true;
+        return handleWrite(conn);
     }
 }
 
@@ -174,8 +273,8 @@ int main() {
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(1234);
-    addr.sin_addr.s_addr = htonl(0);
+    addr.sin_port = ntohs(1234);
+    addr.sin_addr.s_addr = ntohl(0);
     int rv = bind(fd, (const struct sockaddr *)&addr, sizeof(addr));
     if (rv) {
         die("bind()");
@@ -201,7 +300,7 @@ int main() {
             if (!conn) {
                 continue;
             }
-            struct pollfd pfd = {conn->fd, 0, 0};
+            struct pollfd pfd = {conn->fd, POLLERR, 0};
             // poll() flags from latest intent
             if (conn->wantRead) {
                 pfd.events |= POLLIN;
@@ -254,7 +353,6 @@ int main() {
                 delete conn;
             }
         }
-
     }
     return 0;
 }
