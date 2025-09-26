@@ -12,10 +12,15 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
-#include <string>
 // C++
+#include <string>
 #include <vector>
-#include <map>
+// proj
+#include "hashtable.hpp"
+#include <iostream>
+
+#define container_of(ptr, T, member) \
+    ((T *)( (char *)ptr - offsetof(T, member) ))
 
 static void msg(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -151,21 +156,83 @@ uint32_t parseRequest(const uint8_t *data, size_t size, std::vector<std::string>
     return 0;
 }
 
-static std::map<std::string, std::string> gData;
+static struct {
+    HMap db;
+} gData;
+
+struct Entry {
+    struct HNode node;
+    std::string key;
+    std::string val;
+};
+
+static bool entryEq(HNode *a, HNode *b) {
+    struct Entry *left = container_of(a, struct Entry, node);
+    struct Entry *right = container_of(b, struct Entry, node);
+    return left->key == right->key;
+}
+
+// FNV hash
+static uint64_t strHash(const uint8_t *data, size_t len) {
+    uint32_t h = 0x811C9DC5;
+    for (size_t i = 0; i < len; i++) {
+        h = (h + data[i]) * 0x01000193;
+    }
+    return h;
+}
+
+static void doGet(std::vector<std::string> &cmd, Response &out) {
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = strHash((uint8_t *)key.key.data(), key.key.size());
+    HNode *node = hmLookup(&gData.db, &key.node, &entryEq);
+    if (!node) {
+        out.status = RES_NX;
+        return;
+    }
+    const std::string &val = container_of(node, Entry, node)->val;
+    assert(val.size() < k_max_msg);
+    out.data.assign(val.begin(), val.end());
+    out.status = RES_OK;
+}
+
+static void doSet(std::vector<std::string> &cmd, Response &out) {
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = strHash((uint8_t *)key.key.data(), key.key.size());
+    // hashtable lookup
+    HNode *node = hmLookup(&gData.db, &key.node, &entryEq);
+    if (node) {
+        container_of(node, Entry, node)->val.swap(cmd[2]);
+    } else {
+        Entry *entry = new Entry();
+        entry->key.swap(key.key);
+        entry->val.swap(cmd[2]);
+        entry->node.hcode = key.node.hcode;
+        hmInsert(&gData.db, &entry->node);
+    }
+}
+
+static void doDel(std::vector<std::string> &cmd, Response &out) {
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = strHash((uint8_t *)key.key.data(), key.key.size());
+    HNode *node = hmDelete(&gData.db, &key.node, &entryEq);
+    if (node) {
+        delete container_of(node, Entry, node);
+        out.status = RES_OK;
+    } else {
+        out.status = RES_NX;
+    }
+}
 
 static void doRequest(std::vector<std::string> &cmd, Response &resp) {
     if (cmd.size() == 2 && cmd[0] == "get") {
-        auto it = gData.find(cmd[1]);
-        if (it == gData.end()) {
-            resp.status = RES_NX;
-            return;
-        }
-        const std::string &val = it->second;
-        resp.data.assign(val.begin(), val.end());
+        doGet(cmd, resp);
     } else if (cmd.size() == 3 && cmd[0] == "set") {
-        gData[cmd[1]].swap(cmd[2]);
+        doSet(cmd, resp);
     } else if (cmd.size() == 2 && cmd[0] == "del") {
-        gData.erase(cmd[1]);
+        doDel(cmd, resp);
     } else {
         resp.status = RES_ERR;
     }
@@ -285,6 +352,7 @@ int main() {
         die("listen()");
     }
 
+    memset(&gData, 0, sizeof(gData));
     // a map of all client connections
     std::vector<Conn *> fd2conn;
     // event loop
