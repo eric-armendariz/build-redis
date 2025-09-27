@@ -98,3 +98,28 @@ void hmInsert(HMap *hmap, HNode *node) {
     }
     hmHelpRehashing(hmap);
 }
+
+size_t hmSize(HMap *hmap) {
+    return hmap->newer.size + hmap->older.size;
+}
+
+void hmForEach(HMap *hmap, bool(*cb)(HNode *, void *), void *arg) {
+    for (size_t i = 0; i < hmap->newer.size; i++) {
+        HNode *node = hmap->newer.tab[i];
+        while (node) {
+            if (!cb(node, arg)) {
+                return;
+            }
+            node = node->next;
+        }
+    }
+    for (size_t i = 0; i < hmap->older.size; i++) {
+        HNode *node = hmap->older.tab[i];
+        while (node) {
+            if (!cb(node, arg)) {
+                return;
+            }
+            node = node->next;
+        }
+    }
+}

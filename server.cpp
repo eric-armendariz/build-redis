@@ -22,6 +22,8 @@
 #define container_of(ptr, T, member) \
     ((T *)( (char *)ptr - offsetof(T, member) ))
 
+typedef std::vector<uint8_t> Buffer;
+
 static void msg(const char *msg) {
     fprintf(stderr, "%s\n", msg);
 }
@@ -53,7 +55,7 @@ static void fd_set_nb(int fd) {
 }
 
 // append to the back
-static void bufAppend(std::vector<uint8_t> &buf, const uint8_t *data, size_t len) {
+static void bufAppend(Buffer &buf, const uint8_t *data, size_t len) {
     if (len == 0) {
         return;
     }
@@ -61,7 +63,7 @@ static void bufAppend(std::vector<uint8_t> &buf, const uint8_t *data, size_t len
     buf.insert(buf.end(), data, data + len);
 }
 // remove from the front
-static void bufConsume(std::vector<uint8_t> &buf, size_t n) {
+static void bufConsume(Buffer &buf, size_t n) {
     buf.erase(buf.begin(), buf.begin() + n);
 }
 
@@ -74,19 +76,13 @@ struct Conn {
     bool wantWrite = false;
     bool wantClose = false;
     // buffers containing I/O of conn
-    std::vector<uint8_t> incoming;
-    std::vector<uint8_t> outgoing;
+    Buffer incoming;
+    Buffer outgoing;
 };
 
 enum {
-    RES_OK = 0,
-    RES_ERR = 1,
-    RES_NX = 2,
-};
-
-struct Response {
-    uint32_t status = 0;
-    std::vector<uint8_t> data;
+    ERR_UNKNOWN = 1,
+    ERR_TOO_BIG = 2,
 };
 
 static Conn *handleAccept(int fd) {
@@ -156,6 +152,62 @@ uint32_t parseRequest(const uint8_t *data, size_t size, std::vector<std::string>
     return 0;
 }
 
+// supported data types
+enum {
+    TAG_NIL = 0,
+    TAG_ERR = 1,
+    TAG_INT = 2,
+    TAG_STR = 3,
+    TAG_DBL = 4,
+    TAG_ARR = 5,
+};
+
+// help functions for the serialization
+static void bufAppendU8(Buffer &buf, uint8_t data) {
+    buf.push_back(data);
+}
+static void bufAppendU32(Buffer &buf, uint32_t data) {
+    bufAppend(buf, (const uint8_t *)&data, 4);
+}
+static void bufAppendI64(Buffer &buf, int64_t data) {
+    bufAppend(buf, (const uint8_t *)&data, 8);
+}
+static void bufAppendDbl(Buffer &buf, double data) {
+    bufAppend(buf, (const uint8_t *)&data, 8);
+}
+
+static void outNil(Buffer &out) {
+    bufAppendU8(out, TAG_NIL);
+}
+
+static void outErr(Buffer &out, uint32_t code, const std::string &msg) {
+    bufAppendU8(out, TAG_ERR);
+    bufAppendU32(out, code);
+    bufAppendU32(out, (uint32_t)msg.size());
+    bufAppend(out, (const uint8_t *)msg.data(), msg.size());
+}
+
+static void outInt(Buffer &out, int64_t val) {
+    bufAppendU8(out, TAG_INT);
+    bufAppendI64(out, val);
+}
+
+static void outStr(Buffer &out, const char *s, size_t size) {
+    bufAppendU8(out, TAG_STR);
+    bufAppendU32(out, (uint32_t)size);
+    bufAppend(out, (const uint8_t *)s, size);
+}
+
+static void outDbl(Buffer &out, double val) {
+    bufAppendU8(out, TAG_DBL);
+    bufAppendDbl(out, val);
+}
+
+static void outArr(Buffer &out, size_t size) {
+    bufAppendU8(out, TAG_ARR);
+    bufAppendU32(out, (uint32_t)size);
+}
+
 static struct {
     HMap db;
 } gData;
@@ -181,22 +233,19 @@ static uint64_t strHash(const uint8_t *data, size_t len) {
     return h;
 }
 
-static void doGet(std::vector<std::string> &cmd, Response &out) {
+static void doGet(std::vector<std::string> &cmd, Buffer &out) {
     Entry key;
     key.key.swap(cmd[1]);
     key.node.hcode = strHash((uint8_t *)key.key.data(), key.key.size());
     HNode *node = hmLookup(&gData.db, &key.node, &entryEq);
     if (!node) {
-        out.status = RES_NX;
-        return;
+        return outErr(out, ERR_UNKNOWN, "key not found");
     }
     const std::string &val = container_of(node, Entry, node)->val;
-    assert(val.size() < k_max_msg);
-    out.data.assign(val.begin(), val.end());
-    out.status = RES_OK;
+    return outStr(out, val.data(), val.size());
 }
 
-static void doSet(std::vector<std::string> &cmd, Response &out) {
+static void doSet(std::vector<std::string> &cmd, Buffer &out) {
     Entry key;
     key.key.swap(cmd[1]);
     key.node.hcode = strHash((uint8_t *)key.key.data(), key.key.size());
@@ -211,38 +260,68 @@ static void doSet(std::vector<std::string> &cmd, Response &out) {
         entry->node.hcode = key.node.hcode;
         hmInsert(&gData.db, &entry->node);
     }
+    return outNil(out);
 }
 
-static void doDel(std::vector<std::string> &cmd, Response &out) {
+static void doDel(std::vector<std::string> &cmd, Buffer &out) {
     Entry key;
     key.key.swap(cmd[1]);
     key.node.hcode = strHash((uint8_t *)key.key.data(), key.key.size());
     HNode *node = hmDelete(&gData.db, &key.node, &entryEq);
     if (node) {
         delete container_of(node, Entry, node);
-        out.status = RES_OK;
     } else {
-        out.status = RES_NX;
+        outErr(out, ERR_UNKNOWN, "key not found");
     }
+    return outInt(out, node ? 1 : 0);
 }
 
-static void doRequest(std::vector<std::string> &cmd, Response &resp) {
+static bool cbKeys(HNode *node, void *arg) {
+    Buffer &out = *(Buffer *)arg;
+    const std::string &key = container_of(node, Entry, node)->key;
+    outStr(out, key.data(), key.size());
+    return true;
+}
+
+static void doKeys(std::vector<std::string> &, Buffer &out) {
+    outArr(out, (uint32_t)hmSize(&gData.db));
+    hmForEach(&gData.db, &cbKeys, (void *) &out);
+}
+
+static void responseBegin(Buffer &out, size_t *headerPos) {
+    *headerPos = out.size();
+    bufAppendU32(out, 0);
+}
+
+static size_t responseSize(Buffer &out, size_t header) {
+    return out.size() - header - 4;
+}
+
+static void responseEnd(Buffer &out, size_t header) {
+    size_t size = responseSize(out, header);
+    if (size > k_max_msg) {
+        out.resize(header + 4);
+        outErr(out, ERR_TOO_BIG, "response is too big");
+        size = responseSize(out, header);
+    }
+    // message header
+    uint32_t len = (uint32_t)size;
+    memcpy(&out[header], &len, 4);   
+}
+
+
+static void doRequest(std::vector<std::string> &cmd, Buffer &out) {
     if (cmd.size() == 2 && cmd[0] == "get") {
-        doGet(cmd, resp);
+        doGet(cmd, out);
     } else if (cmd.size() == 3 && cmd[0] == "set") {
-        doSet(cmd, resp);
+        doSet(cmd, out);
     } else if (cmd.size() == 2 && cmd[0] == "del") {
-        doDel(cmd, resp);
+        doDel(cmd, out);
+    } else if (cmd.size() == 1 && cmd[0] == "keys") { 
+        doKeys(cmd, out);
     } else {
-        resp.status = RES_ERR;
+        return outErr(out, ERR_UNKNOWN, "unknown command");
     }
-}
-
-void makeResponse(std::vector<std::uint8_t> &buf, Response &resp) {
-    uint32_t respLen = 4 + (uint32_t) resp.data.size();
-    bufAppend(buf, (const uint8_t *)&respLen, 4);
-    bufAppend(buf, (const uint8_t *)&resp.status, 4);
-    bufAppend(buf, resp.data.data(), resp.data.size());
 }
 
 static bool tryOneRequest(Conn *conn) {
@@ -270,9 +349,10 @@ static bool tryOneRequest(Conn *conn) {
     }
     // 4. Process the parsed message
     // generate the response
-    Response resp;
-    doRequest(cmd, resp);
-    makeResponse(conn->outgoing, resp);
+    size_t headerPos = 0;
+    responseBegin(conn->outgoing, &headerPos);
+    doRequest(cmd, conn->outgoing);
+    responseEnd(conn->outgoing, headerPos);
 
     // 5. Remove the message from conn->incoming.
     bufConsume(conn->incoming, 4 + len);
