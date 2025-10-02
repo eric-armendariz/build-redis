@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <math.h>
 // system
 #include <fcntl.h>
 #include <poll.h>
@@ -17,10 +18,9 @@
 #include <vector>
 // proj
 #include "hashtable.hpp"
+#include "zset.hpp"
+#include "common.hpp"
 #include <iostream>
-
-#define container_of(ptr, T, member) \
-    ((T *)( (char *)ptr - offsetof(T, member) ))
 
 typedef std::vector<uint8_t> Buffer;
 
@@ -83,6 +83,7 @@ struct Conn {
 enum {
     ERR_UNKNOWN = 1,
     ERR_TOO_BIG = 2,
+    ERR_BAD_ARG = 3,
 };
 
 static Conn *handleAccept(int fd) {
@@ -208,55 +209,228 @@ static void outArr(Buffer &out, size_t size) {
     bufAppendU32(out, (uint32_t)size);
 }
 
+static bool str2dbl(const std::string &s, double &out) {
+    char *endp = NULL;
+    out = strtod(s.c_str(), &endp);
+    return endp == s.c_str() + s.size() && !isnan(out);
+}
+
+static bool str2int(const std::string &s, int64_t &out) {
+    char *endp = NULL;
+    out = strtoll(s.c_str(), &endp, 10);
+    return endp == s.c_str() + s.size();
+}
+
 static struct {
     HMap db;
 } gData;
 
+enum {
+    T_INIT = 0,
+    T_STR  = 1,
+    T_ZSET = 2,
+};
+
 struct Entry {
     struct HNode node;
     std::string key;
-    std::string val;
+    // value
+    uint32_t type = 0;
+    union {
+        std::string str;
+        ZSet zset;
+    };
+
+    explicit Entry(uint32_t type) : type(type) {
+        if (type == T_ZSET) {
+            new (&zset) ZSet;
+        } else if (type == T_STR) {
+            new (&str) std::string;
+        }
+    }
+
+    ~Entry() {
+        if (type == T_ZSET) {
+            zsetClear(&zset);
+        } else if (type == T_STR) {
+            str.~basic_string();
+        }
+    }
 };
 
-static bool entryEq(HNode *a, HNode *b) {
-    struct Entry *left = container_of(a, struct Entry, node);
-    struct Entry *right = container_of(b, struct Entry, node);
-    return left->key == right->key;
+struct LookupKey {
+    struct HNode node;
+    std::string key;
+};
+
+static Entry *entryNew(uint32_t type) {
+    Entry *ent = new Entry(type);
+    ent->type = type;
+    return ent;
 }
 
-// FNV hash
-static uint64_t strHash(const uint8_t *data, size_t len) {
-    uint32_t h = 0x811C9DC5;
-    for (size_t i = 0; i < len; i++) {
-        h = (h + data[i]) * 0x01000193;
+static void entryDel(Entry *ent) {
+    if (ent->type == T_ZSET) {
+        zsetClear(&ent->zset);
     }
-    return h;
+    delete ent;
+}
+
+static bool entryEq(HNode *node, HNode *key) {
+    struct Entry *ent = container_of(node, struct Entry, node);
+    struct LookupKey *keydata = container_of(key, struct LookupKey, node);
+    return ent->key == keydata->key;
+}
+
+static size_t outBeginArr(Buffer &out) {
+    out.push_back(TAG_ARR);
+    bufAppendU32(out, 0);
+    return out.size() - 4;
+}
+
+static void outEndArr(Buffer &out, size_t ctx, uint32_t n) {
+    assert(out[ctx - 1] == TAG_ARR);
+    memcpy(&out[ctx], &n, 4);
+}
+
+static const ZSet k_empty_zset;
+
+static ZSet *expectZset(std::string &name) {
+    LookupKey key;
+    key.key.swap(name);
+    key.node.hcode = strHash((uint8_t *)key.key.data(), key.key.size());
+    // hashtable lookup
+    HNode *node = hmLookup(&gData.db, &key.node, &entryEq);
+    if (!node) {
+        return (ZSet *)&k_empty_zset;
+    }
+    Entry *ent = container_of(node, Entry, node);
+    return ent->type == T_ZSET ? &ent->zset : NULL;
+}
+
+static void doZQuery(std::vector<std::string> &cmd, Buffer &out) {
+    // parse args
+    double score = 0;
+    if (!str2dbl(cmd[2], score)) {
+        return outErr(out, ERR_BAD_ARG, "expect score to be number");
+    }
+    const std::string &name = cmd[3];
+    int64_t offset = 0, limit = 0;
+    if (!str2int(cmd[4], offset)) {
+        return outErr(out, ERR_BAD_ARG, "expect offset to be number");
+    }
+    if (!str2int(cmd[5], limit)) {
+        return outErr(out, ERR_BAD_ARG, "expect limit to be number");
+    }
+
+    ZSet *zset = expectZset(cmd[1]);
+    if (!zset) {
+        return outErr(out, ERR_BAD_ARG, "expected zset");
+    }
+    
+    if (limit <= 0) {
+        return outArr(out, 0);
+    }
+    // search for key
+    ZNode *znode = zsetSeekge(zset, score, name.data(), name.size());
+    znode = znodeOffset(znode, offset);
+    // iterate and output
+    size_t ctx = outBeginArr(out);
+    int64_t n = 0;
+    while (znode && n < limit) {
+        outStr(out, znode->name, znode->len);
+        outDbl(out, znode->score);
+        znode = znodeOffset(znode, +1);
+        n += 2;
+    }
+    outEndArr(out, ctx, (uint32_t)n);
+}
+
+static void doZAdd(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = strHash((uint8_t *)key.key.data(), key.key.size());
+    double score = 0;
+    if (!str2dbl(cmd[2], score)) {
+        return outErr(out, ERR_BAD_ARG, "expect score to be float");
+    }
+    // hashtable lookup
+    HNode *node = hmLookup(&gData.db, &key.node, &entryEq);
+    Entry *ent = NULL;
+    if (node) {
+        ent = container_of(node, Entry, node);
+        if (ent->type != T_ZSET) {
+            return outErr(out, ERR_BAD_ARG, "expected zset");
+        }
+    } else {
+        ent = entryNew(T_ZSET);
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        hmInsert(&gData.db, &ent->node);
+    }
+
+    // add or update the tuple
+    const std::string &name = cmd[3];
+    bool added = zsetInsert(&ent->zset, name.data(), name.size(), score);
+    return outInt(out, (int64_t)added);
+}
+
+static void doZRem(std::vector<std::string> &cmd, Buffer &out) {
+    ZSet *zset = expectZset(cmd[1]);
+    if (!zset) {
+        return outErr(out, ERR_BAD_ARG, "expected zset");
+    }
+
+    const std::string &name = cmd[2];
+    ZNode *znode = zsetLookup(zset, name.data(), name.size());
+    if (znode) {
+        zsetDelete(zset, znode);
+    }
+    return outInt(out, znode ? 1 : 0);
+}
+
+static void doZScore(std::vector<std::string> &cmd, Buffer &out) {
+    ZSet *zset = expectZset(cmd[1]);
+    if (!zset) {
+        return outErr(out, ERR_BAD_ARG, "expected zset");
+    }
+    const std::string &name = cmd[2];
+    ZNode *znode = zsetLookup(zset, name.data(), name.size());
+    return znode ? outDbl(out, znode->score) : outNil(out);
 }
 
 static void doGet(std::vector<std::string> &cmd, Buffer &out) {
-    Entry key;
+    LookupKey key;
     key.key.swap(cmd[1]);
     key.node.hcode = strHash((uint8_t *)key.key.data(), key.key.size());
     HNode *node = hmLookup(&gData.db, &key.node, &entryEq);
     if (!node) {
         return outErr(out, ERR_UNKNOWN, "key not found");
     }
-    const std::string &val = container_of(node, Entry, node)->val;
-    return outStr(out, val.data(), val.size());
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->type != T_STR) {
+        return outErr(out, ERR_BAD_ARG, "expected string");
+    
+    }
+    return outStr(out, ent->str.data(), ent->str.size());
 }
 
 static void doSet(std::vector<std::string> &cmd, Buffer &out) {
-    Entry key;
+    LookupKey key;
     key.key.swap(cmd[1]);
     key.node.hcode = strHash((uint8_t *)key.key.data(), key.key.size());
     // hashtable lookup
     HNode *node = hmLookup(&gData.db, &key.node, &entryEq);
     if (node) {
-        container_of(node, Entry, node)->val.swap(cmd[2]);
+        Entry *ent = container_of(node, Entry, node);
+        if (ent->type != T_STR) {
+            return outErr(out, ERR_BAD_ARG, "expected string");
+        }
+        ent->str.swap(cmd[2]);
     } else {
-        Entry *entry = new Entry();
+        Entry *entry = entryNew(T_STR);
         entry->key.swap(key.key);
-        entry->val.swap(cmd[2]);
+        entry->str.swap(cmd[2]);
         entry->node.hcode = key.node.hcode;
         hmInsert(&gData.db, &entry->node);
     }
@@ -264,7 +438,7 @@ static void doSet(std::vector<std::string> &cmd, Buffer &out) {
 }
 
 static void doDel(std::vector<std::string> &cmd, Buffer &out) {
-    Entry key;
+    LookupKey key;
     key.key.swap(cmd[1]);
     key.node.hcode = strHash((uint8_t *)key.key.data(), key.key.size());
     HNode *node = hmDelete(&gData.db, &key.node, &entryEq);
@@ -312,13 +486,21 @@ static void responseEnd(Buffer &out, size_t header) {
 
 static void doRequest(std::vector<std::string> &cmd, Buffer &out) {
     if (cmd.size() == 2 && cmd[0] == "get") {
-        doGet(cmd, out);
+        return doGet(cmd, out);
     } else if (cmd.size() == 3 && cmd[0] == "set") {
-        doSet(cmd, out);
+        return doSet(cmd, out);
     } else if (cmd.size() == 2 && cmd[0] == "del") {
-        doDel(cmd, out);
+        return doDel(cmd, out);
     } else if (cmd.size() == 1 && cmd[0] == "keys") { 
-        doKeys(cmd, out);
+        return doKeys(cmd, out);
+    } else if (cmd.size() == 4 && cmd[0] == "zadd") {
+        return doZAdd(cmd, out);
+    } else if (cmd.size() == 6 && cmd[0] == "zquery") {
+        return doZQuery(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "zscore") {
+        return doZScore(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "zrem") {
+        return doZRem(cmd, out);
     } else {
         return outErr(out, ERR_UNKNOWN, "unknown command");
     }

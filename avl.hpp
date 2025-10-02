@@ -25,3 +25,4 @@ static void avlUpdate(AVLNode *node);
 // API
 AVLNode *avlFix(AVLNode *node);
 AVLNode *avlDel(AVLNode *node);
+AVLNode *avlOffset(AVLNode *node, int64_t offset);

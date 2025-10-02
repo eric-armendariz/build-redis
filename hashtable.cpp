@@ -123,3 +123,9 @@ void hmForEach(HMap *hmap, bool(*cb)(HNode *, void *), void *arg) {
         }
     }
 }
+
+void hmClear(HMap *hmap) {
+    free(hmap->newer.tab);
+    free(hmap->older.tab);
+    *hmap = HMap{};
+}

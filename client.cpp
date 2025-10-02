@@ -91,7 +91,7 @@ static int32_t printResponse(const uint8_t *data, size_t size) {
     }
     switch (data[0]) {
         case TAG_NIL:
-            printf("nil\n");
+            printf("(nil)\n");
             return 1;
             
         case TAG_ERR: {
@@ -122,7 +122,7 @@ static int32_t printResponse(const uint8_t *data, size_t size) {
                 msg("bad response");
                 return -1;
             }
-            printf("str: %.*s\n", len, &data[5]);
+            printf("(str) %.*s\n", len, &data[5]);
             return 5 + len;
         }
         
@@ -133,7 +133,7 @@ static int32_t printResponse(const uint8_t *data, size_t size) {
             }
             int64_t val = 0;
             memcpy(&val, &data[1], 8);
-            printf("int: %ld\n", val);
+            printf("(int) %ld\n", val);
             return 9;
         }
         
@@ -144,7 +144,7 @@ static int32_t printResponse(const uint8_t *data, size_t size) {
             }
             double dbl = 0;
             memcpy(&dbl, &data[1], 8);
-            printf("dbl: %f\n", dbl);
+            printf("(dbl) %g\n", dbl);
             return 9;
         }
         
