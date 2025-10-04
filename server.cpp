@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
+#include <time.h>
 // C++
 #include <string>
 #include <vector>
@@ -20,6 +21,7 @@
 #include "hashtable.hpp"
 #include "zset.hpp"
 #include "common.hpp"
+#include "list.h"
 #include <iostream>
 
 typedef std::vector<uint8_t> Buffer;
@@ -35,6 +37,12 @@ static void msg_errno(const char *msg) {
 static void die(const char *msg) {
     fprintf(stderr, "[%d] %s\n", errno, msg);
     abort();
+}
+
+static uint64_t getMonotonicMs() {
+    struct timespec tv = {0, 0};
+    clock_gettime(CLOCK_MONOTONIC, &tv);
+    return uint64_t(tv.tv_sec) * 1000 + tv.tv_nsec / 1000 / 1000;
 }
 
 static void fd_set_nb(int fd) {
@@ -69,6 +77,8 @@ static void bufConsume(Buffer &buf, size_t n) {
 
 const size_t k_max_msg = 32 << 20;  // likely larger than the kernel buffer
 
+const uint64_t k_idle_timeout_ms = 5 * 1000;
+
 struct Conn {
     int fd = -1;
     // state of conn for the event loop
@@ -78,6 +88,9 @@ struct Conn {
     // buffers containing I/O of conn
     Buffer incoming;
     Buffer outgoing;
+    // timers
+    uint64_t lastActiveMs = 0;
+    DList idleNode;
 };
 
 enum {
@@ -85,31 +98,6 @@ enum {
     ERR_TOO_BIG = 2,
     ERR_BAD_ARG = 3,
 };
-
-static Conn *handleAccept(int fd) {
-    // accept
-    struct sockaddr_in client_addr = {};
-    socklen_t addrlen = sizeof(client_addr);
-    int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
-    if (connfd < 0) {
-        msg_errno("accept() error");
-        return NULL;
-    }
-    uint32_t ip = client_addr.sin_addr.s_addr;
-    fprintf(stderr, "new client from %u.%u.%u.%u:%u\n",
-        ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24,
-        ntohs(client_addr.sin_port)
-    );
-
-    // set the new connection fd to nonblocking mode
-    fd_set_nb(connfd);
-
-    // create a `struct Conn`
-    Conn *conn = new Conn();
-    conn->fd = connfd;
-    conn->wantRead = true;
-    return conn;
-}
 
 bool readUInt32(const uint8_t *&curr, const uint8_t *end, uint32_t &out) {
     if (curr + 4 > end) {
@@ -223,7 +211,45 @@ static bool str2int(const std::string &s, int64_t &out) {
 
 static struct {
     HMap db;
+    // a map of all client connections
+    std::vector<Conn *> fd2conn;
+    // timers for idle connections
+    DList idleList;
 } gData;
+
+static Conn *handleAccept(int fd) {
+    // accept
+    struct sockaddr_in client_addr = {};
+    socklen_t addrlen = sizeof(client_addr);
+    int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
+    if (connfd < 0) {
+        msg_errno("accept() error");
+        return NULL;
+    }
+    uint32_t ip = client_addr.sin_addr.s_addr;
+    fprintf(stderr, "new client from %u.%u.%u.%u:%u\n",
+        ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24,
+        ntohs(client_addr.sin_port)
+    );
+
+    // set the new connection fd to nonblocking mode
+    fd_set_nb(connfd);
+
+    // create a `struct Conn`
+    Conn *conn = new Conn();
+    conn->fd = connfd;
+    conn->wantRead = true;
+    conn->lastActiveMs = getMonotonicMs();
+    dlistInsertBefore(&gData.idleList, &conn->idleNode);
+    return conn;
+}
+
+static void connDestroy(Conn *conn) {
+    (void)close(conn->fd);
+    gData.fd2conn[conn->fd] = NULL;
+    dlistDetach(&conn->idleNode);
+    delete conn;
+}
 
 enum {
     T_INIT = 0,
@@ -596,6 +622,32 @@ static void handleRead(Conn *conn) {
     }
 }
 
+static int32_t nextTimerMs() {
+    if (dlistEmpty(&gData.idleList)) {
+        return -1;
+    }
+    uint32_t nowMs = getMonotonicMs();
+    Conn *conn = container_of(gData.idleList.next, Conn, idleNode);
+    uint64_t nextMs = conn->lastActiveMs + k_idle_timeout_ms;
+    if (nextMs <= nowMs) {
+        return 0;
+    }
+    return (int32_t)(nextMs - nowMs);
+}
+
+static void processTimers() {
+    uint64_t nowMs = getMonotonicMs();
+    while (!dlistEmpty(&gData.idleList)) {
+        Conn *conn = container_of(gData.idleList.next, Conn, idleNode);
+        uint64_t nextMs = conn->lastActiveMs + k_idle_timeout_ms;
+        if (nextMs >= nowMs) {
+            break;
+        }
+        fprintf(stderr, "removing idle connection: %d\n", conn->fd);
+        connDestroy(conn);
+    }
+}
+
 int main() {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     int val = 1;
@@ -615,8 +667,7 @@ int main() {
     }
 
     memset(&gData, 0, sizeof(gData));
-    // a map of all client connections
-    std::vector<Conn *> fd2conn;
+    dlistInit(&gData.idleList);
     // event loop
     std::vector<struct pollfd> pollArgs;
     while (true) {
@@ -626,7 +677,7 @@ int main() {
         struct pollfd pfd = {fd, POLLIN, 0};
         pollArgs.push_back(pfd);
         // the rest are connection sockets
-        for (Conn *conn : fd2conn) {
+        for (Conn *conn : gData.fd2conn) {
             if (!conn) {
                 continue;
             }
@@ -640,8 +691,9 @@ int main() {
             }
             pollArgs.push_back(pfd);
         }
+        int32_t timeoutMs = nextTimerMs();
         // poll() the client conns
-        int rv = poll(pollArgs.data(), (nfds_t)pollArgs.size(), -1);
+        int rv = poll(pollArgs.data(), (nfds_t)pollArgs.size(), timeoutMs);
         if (rv < 0 && errno == EINTR) {
             continue;
         } else if (rv < 0) {
@@ -651,11 +703,11 @@ int main() {
         // handle the listening socket
         if (pollArgs[0].revents & POLLIN) {
             if (Conn *conn = handleAccept(fd)) {
-                if (fd2conn.size() <= (size_t)conn->fd) {
-                    fd2conn.resize(conn->fd + 1);
+                if (gData.fd2conn.size() <= (size_t)conn->fd) {
+                    gData.fd2conn.resize(conn->fd + 1);
                 }
-                assert(!fd2conn[conn->fd]);
-                fd2conn[conn->fd] = conn;
+                assert(!gData.fd2conn[conn->fd]);
+                gData.fd2conn[conn->fd] = conn;
             }
         }
 
@@ -666,7 +718,10 @@ int main() {
                 continue;
             }
 
-            Conn *conn = fd2conn[pollArgs[i].fd];
+            Conn *conn = gData.fd2conn[pollArgs[i].fd];
+            conn->lastActiveMs = getMonotonicMs();
+            dlistDetach(&conn->idleNode);
+            dlistInsertBefore(&gData.idleList, &conn->idleNode);
             if (ready & POLLIN) {
                 assert(conn->wantRead);
                 handleRead(conn);
@@ -678,11 +733,10 @@ int main() {
 
             // close sockets from error or app logic
             if ((ready & POLLERR) || conn->wantClose) {
-                (void)close(conn->fd);
-                fd2conn[conn->fd] = NULL;
-                delete conn;
+                connDestroy(conn);
             }
         }
+        processTimers();
     }
     return 0;
 }
