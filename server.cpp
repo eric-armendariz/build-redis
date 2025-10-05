@@ -22,6 +22,7 @@
 #include "zset.hpp"
 #include "common.hpp"
 #include "list.h"
+#include "heap.h"
 #include <iostream>
 
 typedef std::vector<uint8_t> Buffer;
@@ -215,6 +216,8 @@ static struct {
     std::vector<Conn *> fd2conn;
     // timers for idle connections
     DList idleList;
+    // timers for TTLs
+    std::vector<HeapItem> heap;
 } gData;
 
 static Conn *handleAccept(int fd) {
@@ -260,6 +263,8 @@ enum {
 struct Entry {
     struct HNode node;
     std::string key;
+    // for TTL
+    size_t heapIdx = -1;
     // value
     uint32_t type = 0;
     union {
@@ -289,6 +294,38 @@ struct LookupKey {
     std::string key;
 };
 
+static void heapUpsert(std::vector<HeapItem> &a, size_t pos, HeapItem t) {
+    if (pos < a.size()) {
+        a[pos] = t;
+    } else {
+        pos = a.size();
+        a.push_back(t);
+    }
+    heapUpdate(a.data(), pos, a.size());
+}
+
+static void heapDelete(std::vector<HeapItem> &a, size_t pos) {
+    // swap erased item with last item
+    a[pos] = a.back();
+    a.pop_back();
+    if (pos < a.size()) {
+        heapUpdate(a.data(), pos, a.size());
+    }
+}
+
+// set or remove the TTL
+static void entrySetTTL(Entry *ent, int64_t ttlMs) {
+    if (ttlMs < 0 && ent->heapIdx != (size_t)-1) {
+        // remove negative ttl's
+        heapDelete(gData.heap, ent->heapIdx);
+        ent->heapIdx = (size_t)-1;
+    } else if (ttlMs >= 0) {
+        uint64_t expireAt = getMonotonicMs() + (uint64_t)ttlMs;
+        HeapItem item = {expireAt, &ent->heapIdx};
+        heapUpsert(gData.heap, ent->heapIdx, item);
+    } 
+}
+
 static Entry *entryNew(uint32_t type) {
     Entry *ent = new Entry(type);
     ent->type = type;
@@ -299,6 +336,7 @@ static void entryDel(Entry *ent) {
     if (ent->type == T_ZSET) {
         zsetClear(&ent->zset);
     }
+    entrySetTTL(ent, -1);
     delete ent;
 }
 
@@ -488,6 +526,42 @@ static void doKeys(std::vector<std::string> &, Buffer &out) {
     hmForEach(&gData.db, &cbKeys, (void *) &out);
 }
 
+// PEXPIRE key ttl_ms
+static void doExpire(std::vector<std::string> &cmd, Buffer &out) {
+    int64_t ttlMs = 0;
+    if (!str2int(cmd[2], ttlMs)) {
+        return outErr(out, ERR_BAD_ARG, "expect ttl to be number");
+    }
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = strHash((uint8_t *)key.key.data(), key.key.size());
+    HNode *node = hmLookup(&gData.db, &key.node, &entryEq);
+    if (node) {
+        Entry *ent = container_of(node, Entry, node);
+        entrySetTTL(ent, ttlMs);
+    }
+    return outInt(out, node ? 1 : 0);
+}
+
+// PTTL key
+static void doTtl(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = strHash((uint8_t *)key.key.data(), key.key.size());
+    HNode *node = hmLookup(&gData.db, &key.node, &entryEq);
+    if (!node) {
+        return outInt(out, -2);
+    }
+
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->heapIdx == (size_t)-1) {
+        return outInt(out, -1);
+    }
+    uint64_t expireAt = gData.heap[ent->heapIdx].val;
+    uint64_t nowMs = getMonotonicMs();
+    return outInt(out, expireAt > nowMs ? (int64_t)(expireAt - nowMs) : 0);
+}
+
 static void responseBegin(Buffer &out, size_t *headerPos) {
     *headerPos = out.size();
     bufAppendU32(out, 0);
@@ -527,6 +601,10 @@ static void doRequest(std::vector<std::string> &cmd, Buffer &out) {
         return doZScore(cmd, out);
     } else if (cmd.size() == 3 && cmd[0] == "zrem") {
         return doZRem(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "pexpire") {
+        return doExpire(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "pttl") {
+        return doTtl(cmd, out);
     } else {
         return outErr(out, ERR_UNKNOWN, "unknown command");
     }
@@ -623,12 +701,22 @@ static void handleRead(Conn *conn) {
 }
 
 static int32_t nextTimerMs() {
-    if (dlistEmpty(&gData.idleList)) {
+    uint32_t nowMs = getMonotonicMs();
+    // max val since this is unsigned
+    uint64_t nextMs = (uint64_t)-1;
+    // idle timers from clients
+    if (!dlistEmpty(&gData.idleList)) {
+        Conn *conn = container_of(gData.idleList.next, Conn, idleNode);
+        nextMs = conn->lastActiveMs + k_idle_timeout_ms;
+    }
+    // TTL timers on DB
+    if (!gData.heap.empty() && gData.heap[0].val <= nextMs) {
+        nextMs = gData.heap[0].val;
+    }
+    // timeout value
+    if (nextMs == (uint64_t)-1) {
         return -1;
     }
-    uint32_t nowMs = getMonotonicMs();
-    Conn *conn = container_of(gData.idleList.next, Conn, idleNode);
-    uint64_t nextMs = conn->lastActiveMs + k_idle_timeout_ms;
     if (nextMs <= nowMs) {
         return 0;
     }
@@ -637,6 +725,7 @@ static int32_t nextTimerMs() {
 
 static void processTimers() {
     uint64_t nowMs = getMonotonicMs();
+    // idle timers from clients
     while (!dlistEmpty(&gData.idleList)) {
         Conn *conn = container_of(gData.idleList.next, Conn, idleNode);
         uint64_t nextMs = conn->lastActiveMs + k_idle_timeout_ms;
@@ -645,6 +734,15 @@ static void processTimers() {
         }
         fprintf(stderr, "removing idle connection: %d\n", conn->fd);
         connDestroy(conn);
+    }
+    // TTL timers for DB entries
+    const std::vector<HeapItem> &heap = gData.heap;
+    const size_t kMaxWorks = 2000;
+    size_t nworks = 0;
+    while (!heap.empty() && heap[0].val <= nowMs && nworks++ < kMaxWorks) {
+        Entry *ent = container_of(heap[0].ref, Entry, heapIdx);
+        hmDelete(&gData.db, &ent->node, &entryEq);
+        entryDel(ent);
     }
 }
 
