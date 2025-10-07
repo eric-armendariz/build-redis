@@ -23,6 +23,7 @@
 #include "common.hpp"
 #include "list.h"
 #include "heap.h"
+#include "threadpool.h"
 #include <iostream>
 
 typedef std::vector<uint8_t> Buffer;
@@ -218,6 +219,7 @@ static struct {
     DList idleList;
     // timers for TTLs
     std::vector<HeapItem> heap;
+    ThreadPool threadPool;
 } gData;
 
 static Conn *handleAccept(int fd) {
@@ -332,12 +334,27 @@ static Entry *entryNew(uint32_t type) {
     return ent;
 }
 
-static void entryDel(Entry *ent) {
+static void entryDelSync(Entry *ent) {
     if (ent->type == T_ZSET) {
         zsetClear(&ent->zset);
     }
-    entrySetTTL(ent, -1);
     delete ent;
+}
+
+static void entryDelFunc(void *arg) {
+    entryDelSync((Entry *)arg);
+}
+
+static void entryDel(Entry *ent) {
+    entrySetTTL(ent, -1);
+    // Run destructor in thread pool for large data structures
+    size_t setSize = (ent->type == T_ZSET) ? hmSize(&ent->zset.hmap) : 0;
+    const size_t largeContainerSize = 1000;
+    if (setSize > largeContainerSize) {
+        threadPoolQueue(&gData.threadPool, &entryDelFunc, ent);
+    } else {
+        entryDelSync(ent);
+    }
 }
 
 static bool entryEq(HNode *node, HNode *key) {
@@ -507,7 +524,7 @@ static void doDel(std::vector<std::string> &cmd, Buffer &out) {
     key.node.hcode = strHash((uint8_t *)key.key.data(), key.key.size());
     HNode *node = hmDelete(&gData.db, &key.node, &entryEq);
     if (node) {
-        delete container_of(node, Entry, node);
+        entryDel(container_of(node, Entry, node));
     } else {
         outErr(out, ERR_UNKNOWN, "key not found");
     }
@@ -766,6 +783,7 @@ int main() {
 
     memset(&gData, 0, sizeof(gData));
     dlistInit(&gData.idleList);
+    threadPoolInit(&gData.threadPool, 4);
     // event loop
     std::vector<struct pollfd> pollArgs;
     while (true) {
